@@ -1,36 +1,10 @@
 defmodule IrohBeam.Native do
   @moduledoc false
 
-  @version Mix.Project.config()[:version]
-  @force_build Mix.env() == :test or
-                 not File.exists?(
-                   Path.expand("../../checksum-Elixir.IrohBeam.Native.exs", __DIR__)
-                 ) or
-                 String.downcase(System.get_env("IROH_BEAM_BUILD", "")) in [
-                   "1",
-                   "true",
-                   "yes",
-                   "on"
-                 ]
-
-  use RustlerPrecompiled,
+  use Rustler,
     otp_app: :iroh_beam,
     crate: "iroh_beam_nif",
-    base_url: "https://github.com/mindreframer/iroh_beam/releases/download/v#{@version}",
-    version: @version,
-    nif_versions: ["2.16"],
-    targets: ~w(
-      aarch64-apple-darwin
-      x86_64-apple-darwin
-      aarch64-unknown-linux-gnu
-      aarch64-unknown-linux-musl
-      x86_64-unknown-linux-gnu
-      x86_64-unknown-linux-musl
-      x86_64-pc-windows-msvc
-    ),
-    force_build: @force_build,
     path: "native/iroh_beam_nif",
-    cargo: {:system, "+1.91.0"},
     mode: if(Mix.env() == :prod, do: :release, else: :debug),
     features: ["nif_version_2_16"]
 

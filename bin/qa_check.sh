@@ -32,6 +32,12 @@ cleanup() {
     docker compose logs --no-color --tail=200 iroh-relay || true
   fi
 
+  relay_pid_file="${TMPDIR:-/tmp}/iroh-beam-test-relay.pid"
+  if [[ -n "${IROH_BEAM_RELAY_BIN:-}" && -f "${relay_pid_file}" ]]; then
+    kill "$(cat "${relay_pid_file}")" 2>/dev/null || true
+    rm -f "${relay_pid_file}"
+  fi
+
   exit "${status}"
 }
 
@@ -45,31 +51,35 @@ printf '[qa/elixir] OTP %s\n' "${otp_release}"
 mix format --check-formatted
 MIX_ENV=test mix compile --warnings-as-errors
 
-qa_stage docker "start or reuse pinned Iroh relay"
-run_quiet docker info
-run_quiet docker compose config --quiet
-compose_used=1
-previous_relay_container_id="$(docker compose ps --quiet iroh-relay)"
-run_quiet docker compose up --detach iroh-relay
-relay_container_id="$(docker compose ps --quiet iroh-relay)"
-test -n "${relay_container_id}"
-
-relay_ready=0
-for _attempt in $(seq 1 45); do
-  if curl --fail --silent --show-error http://127.0.0.1:3340/ >/dev/null 2>&1; then
-    relay_ready=1
-    break
-  fi
-  sleep 1
-done
-test "${relay_ready}" -eq 1
-
-if [[ "${previous_relay_container_id}" == "${relay_container_id}" ]]; then
-  relay_state="reused"
+if [[ -n "${IROH_BEAM_RELAY_BIN:-}" ]]; then
+  qa_stage relay "native iroh-relay, started by the relay tests"
 else
-  relay_state="started"
+  qa_stage docker "start or reuse pinned Iroh relay"
+  run_quiet docker info
+  run_quiet docker compose config --quiet
+  compose_used=1
+  previous_relay_container_id="$(docker compose ps --quiet iroh-relay)"
+  run_quiet docker compose up --detach iroh-relay
+  relay_container_id="$(docker compose ps --quiet iroh-relay)"
+  test -n "${relay_container_id}"
+
+  relay_ready=0
+  for _attempt in $(seq 1 45); do
+    if curl --fail --silent --show-error http://127.0.0.1:3340/ >/dev/null 2>&1; then
+      relay_ready=1
+      break
+    fi
+    sleep 1
+  done
+  test "${relay_ready}" -eq 1
+
+  if [[ "${previous_relay_container_id}" == "${relay_container_id}" ]]; then
+    relay_state="reused"
+  else
+    relay_state="started"
+  fi
+  printf '[qa/docker] Iroh relay ready (%s)\n' "${relay_state}"
 fi
-printf '[qa/docker] Iroh relay ready (%s)\n' "${relay_state}"
 
 qa_stage elixir "ExUnit unit and direct integration"
 MIX_ENV=test mix test --no-compile
@@ -80,16 +90,16 @@ run_quiet epmd -names
 IROH_BEAM_RELAY_INTEGRATION=1 MIX_ENV=test mix test --no-compile --only relay
 
 qa_stage rust "format"
-cargo +1.91.0 fmt --manifest-path native/iroh_beam_nif/Cargo.toml --all -- --check
+cargo fmt --manifest-path native/iroh_beam_nif/Cargo.toml --all -- --check
 
 qa_stage rust "check"
-cargo +1.91.0 check --manifest-path native/iroh_beam_nif/Cargo.toml --locked --all-targets
+cargo check --manifest-path native/iroh_beam_nif/Cargo.toml --locked --all-targets
 
 qa_stage rust "Clippy"
-cargo +1.91.0 clippy --manifest-path native/iroh_beam_nif/Cargo.toml --locked --all-targets -- -D warnings
+cargo clippy --manifest-path native/iroh_beam_nif/Cargo.toml --locked --all-targets -- -D warnings
 
 qa_stage rust "tests"
-cargo +1.91.0 test --manifest-path native/iroh_beam_nif/Cargo.toml --locked --all-targets
+cargo test --manifest-path native/iroh_beam_nif/Cargo.toml --locked --all-targets
 
 qa_stage release "version, docs, and package audit"
 test "$(bin/project_version.sh)" = "0.2.0"

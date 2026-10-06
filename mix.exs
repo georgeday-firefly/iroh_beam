@@ -42,25 +42,24 @@ defmodule IrohBeam.MixProject do
         "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"
       },
       build_tools: ["mix", "cargo"],
-      files:
-        [
-          "lib",
-          "src",
-          "native/iroh_beam_nif/src",
-          "native/iroh_beam_nif/.cargo",
-          "native/iroh_beam_nif/Cargo.toml",
-          "native/iroh_beam_nif/Cargo.lock",
-          "rust-toolchain.toml",
-          ".formatter.exs",
-          "mix.exs",
-          "README.md",
-          "LICENSE",
-          "NOTICE",
-          "CHANGELOG.md",
-          "SECURITY.md",
-          "docs",
-          "examples"
-        ] ++ Path.wildcard("checksum-Elixir.IrohBeam.Native.exs")
+      files: [
+        "lib",
+        "src",
+        "native/iroh_beam_nif/src",
+        "native/iroh_beam_nif/.cargo",
+        "native/iroh_beam_nif/Cargo.toml",
+        "native/iroh_beam_nif/Cargo.lock",
+        "rust-toolchain.toml",
+        ".formatter.exs",
+        "mix.exs",
+        "README.md",
+        "LICENSE",
+        "NOTICE",
+        "CHANGELOG.md",
+        "SECURITY.md",
+        "docs",
+        "examples"
+      ]
     ]
   end
 
@@ -96,8 +95,7 @@ defmodule IrohBeam.MixProject do
 
   defp deps do
     [
-      {:rustler, "== 0.38.0", optional: true, runtime: false},
-      {:rustler_precompiled, "== 0.8.4"},
+      {:rustler, "== 0.38.0", runtime: false},
       {:telemetry, "== 1.4.2"},
       {:dev_cluster, "== 0.1.0", only: :test},
       {:ex_doc, "== 0.40.3", only: :dev, runtime: false}

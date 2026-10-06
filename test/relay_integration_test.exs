@@ -12,7 +12,8 @@ defmodule IrohBeam.RelayIntegrationTest do
   @alpn "iroh-beam/private-relay-test/1"
 
   setup do
-    assert relay_ready?()
+    {_output, 0} = IrohBeam.TestRelay.up()
+    assert_eventually(&relay_ready?/0, 15_000)
     :ok
   end
 
@@ -135,8 +136,7 @@ defmodule IrohBeam.RelayIntegrationTest do
     assert :ok = Endpoint.await_online(first, 10_000)
     assert :ok = Endpoint.close(first)
 
-    {output, status} =
-      System.cmd("docker", ["compose", "restart", "iroh-relay"], stderr_to_stdout: true)
+    {output, status} = IrohBeam.TestRelay.restart()
 
     assert status == 0, output
     assert_eventually(&relay_ready?/0, 15_000)

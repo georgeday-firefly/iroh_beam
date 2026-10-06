@@ -150,6 +150,63 @@ defmodule IrohBeam.DistributionPeerScript do
             IO.puts(["FAULT ", inspect(result), " ", inspect(Node.list())])
             loop(peer)
 
+          "LARGE50" ->
+            :net_kernel.monitor_nodes(true)
+            payload = :binary.copy(<<0x5A>>, 50 * 1024 * 1024)
+            pinger = spawn(fn -> ping_loop(peer) end)
+            result = :rpc.call(peer, __MODULE__, :echo, [payload], 60_000)
+            Process.exit(pinger, :kill)
+            downs = count_nodedowns(peer, 0)
+            :net_kernel.monitor_nodes(false)
+            IO.puts(["LARGE50 ", inspect(result == payload), " nodedowns=", inspect(downs)])
+            loop(peer)
+
+          "PATHEVENT" ->
+            parent = self()
+            ref = make_ref()
+
+            :telemetry.attach(
+              {__MODULE__, ref},
+              [:iroh_beam, :distribution, :path],
+              fn _event, measurements, metadata, _config ->
+                send(parent, {ref, metadata.kind, measurements.rtt_us})
+              end,
+              nil
+            )
+
+            result =
+              receive do
+                {^ref, kind, rtt_us} -> {kind, is_integer(rtt_us)}
+              after
+                7_000 -> :timeout
+              end
+
+            :telemetry.detach({__MODULE__, ref})
+            IO.puts(["PATHEVENT ", inspect(result)])
+            loop(peer)
+
+          "REJECTIONS" ->
+            IO.puts(["REJECTIONS ", inspect(Agent.get(:rejections, &Enum.reverse/1))])
+            loop(peer)
+
+          "ADMIT " <> rest ->
+            [id, name] = String.split(rest)
+            IrohBeam.TestAdmission.allow(id, name)
+            IO.puts("ADMIT ok")
+            loop(peer)
+
+          "ATOM " <> name ->
+            exists =
+              try do
+                _ = String.to_existing_atom(name)
+                true
+              rescue
+                ArgumentError -> false
+              end
+
+            IO.puts(["ATOM ", inspect(exists)])
+            loop(peer)
+
           "LARGE" ->
             payload = :binary.copy(<<0xA5>>, 2 * 1024 * 1024)
             result = :rpc.call(peer, __MODULE__, :echo, [payload], 15_000)
@@ -205,6 +262,20 @@ defmodule IrohBeam.DistributionPeerScript do
     end
   end
 
+  defp ping_loop(peer) do
+    Node.ping(peer)
+    Process.sleep(500)
+    ping_loop(peer)
+  end
+
+  defp count_nodedowns(peer, count) do
+    receive do
+      {:nodedown, ^peer} -> count_nodedowns(peer, count + 1)
+    after
+      0 -> count
+    end
+  end
+
   defp stop do
     _ = IrohBeam.Distribution.stop()
     IO.puts("PEER_STOPPED")
@@ -216,10 +287,26 @@ options = options_path |> File.read!() |> :erlang.binary_to_term()
 peers = options |> Keyword.fetch!(:peers) |> Map.keys()
 requested_peer = System.get_env("IROH_BEAM_DISTRIBUTION_PEER")
 
+# A requested peer outside the static map is a name@<endpoint id> admission peer.
 peer =
-  Enum.find(peers, List.first(peers), fn node ->
-    is_binary(requested_peer) and Atom.to_string(node) == requested_peer
-  end)
+  Enum.find(peers, fn node -> Atom.to_string(node) == requested_peer end) ||
+    if(requested_peer, do: String.to_atom(requested_peer), else: List.first(peers))
+
+for entry <- String.split(System.get_env("IROH_BEAM_TEST_ADMIT", ""), ";", trim: true) do
+  [id, name] = String.split(entry, "=")
+  IrohBeam.TestAdmission.allow(id, name)
+end
+
+{:ok, _agent} = Agent.start(fn -> [] end, name: :rejections)
+
+:telemetry.attach(
+  :peer_rejections,
+  [:iroh_beam, :distribution, :peer, :rejected],
+  fn _event, _measurements, %{stage: stage}, _config ->
+    Agent.update(:rejections, &[stage | &1])
+  end,
+  nil
+)
 
 {:ok, _pid} = IrohBeam.Distribution.start(options)
 

@@ -12,6 +12,8 @@ defmodule IrohBeam.Distribution.Config do
   @default_stream_timeout 10_000
   @default_receive_chunk 64 * 1024
   @default_max_frame 16 * 1024 * 1024
+  @id_host ~r/\A[0-9a-f]{64}\z/
+  @name_part ~r/\A[0-9A-Za-z_-]{1,64}\z/
 
   @enforce_keys [
     :mode,
@@ -23,6 +25,7 @@ defmodule IrohBeam.Distribution.Config do
     :direct_ip,
     :peers,
     :ids,
+    :admission,
     :startup_timeout,
     :shutdown_timeout,
     :connect_timeout,
@@ -53,6 +56,7 @@ defmodule IrohBeam.Distribution.Config do
              bind: [],
              direct_ip: true,
              peers: %{},
+             admission: nil,
              startup_timeout: @default_startup_timeout,
              shutdown_timeout: @default_shutdown_timeout,
              connect_timeout: @default_connect_timeout,
@@ -71,6 +75,7 @@ defmodule IrohBeam.Distribution.Config do
          :ok <- validate_network(options[:network]),
          :ok <- validate_bind(options[:bind], options[:direct_ip]),
          {:ok, peers, ids} <- normalize_peers(options[:peers], options[:name]),
+         :ok <- validate_admission(options[:admission], options[:name]),
          :ok <- validate_limits(options) do
       {:ok,
        struct!(__MODULE__,
@@ -83,6 +88,7 @@ defmodule IrohBeam.Distribution.Config do
          direct_ip: options[:direct_ip],
          peers: peers,
          ids: ids,
+         admission: options[:admission],
          startup_timeout: options[:startup_timeout],
          shutdown_timeout: options[:shutdown_timeout],
          connect_timeout: options[:connect_timeout],
@@ -128,10 +134,29 @@ defmodule IrohBeam.Distribution.Config do
 
   def get, do: :persistent_term.get(@bootstrap_key, :undefined)
 
-  def resolve(%__MODULE__{peers: peers}, node) when is_atom(node) do
+  def resolve(%__MODULE__{peers: peers} = config, node) when is_atom(node) do
     case Map.fetch(peers, node) do
       {:ok, peer} -> {:ok, peer}
-      :error -> {:error, :unknown_peer}
+      :error -> resolve_by_name(config, node)
+    end
+  end
+
+  @doc """
+  Admits an incoming connection by its authenticated endpoint ID, before any
+  stream is accepted. Static configurations are already filtered natively.
+  """
+  def admit_connection(%__MODULE__{admission: nil}, _remote_id), do: true
+
+  def admit_connection(%__MODULE__{} = config, remote_id),
+    do: admit(config, to_string(remote_id), nil)
+
+  @doc "Checks that a `name@<endpoint id>` local node name matches the endpoint's own ID."
+  def own_name?(%__MODULE__{admission: nil}, _id), do: true
+
+  def own_name?(%__MODULE__{} = config, id) do
+    case split_id_name(Atom.to_string(config.name)) do
+      {:ok, _name, host} -> host == to_string(id)
+      :error -> false
     end
   end
 
@@ -145,19 +170,13 @@ defmodule IrohBeam.Distribution.Config do
 
   def authorize_claim(%__MODULE__{} = config, remote_name, remote_id, target_name)
       when is_binary(remote_name) and is_binary(target_name) do
-    expected_target = Atom.to_string(config.name)
-
-    with true <- target_name == expected_target,
-         {node, peer} when not is_nil(node) <-
-           Enum.find(config.peers, fn {node, _peer} -> Atom.to_string(node) == remote_name end),
-         true <- peer.id == remote_id do
+    with true <- target_name == Atom.to_string(config.name),
+         {:ok, node} <- claimed_node(config, remote_name, remote_id) do
       {:ok, node}
     else
       _ -> {:error, :identity_name_mismatch}
     end
   end
-
-  def allowed_nodes(%__MODULE__{peers: peers}), do: Map.keys(peers)
 
   def endpoint_options(%__MODULE__{} = config) do
     [
@@ -169,7 +188,7 @@ defmodule IrohBeam.Distribution.Config do
       startup_timeout: config.startup_timeout,
       shutdown_timeout: config.shutdown_timeout,
       limits: [max_connections: config.max_connections, max_pending_accepts: 1],
-      peer_allowlist: Enum.map(config.peers, fn {_node, peer} -> peer.id end)
+      peer_allowlist: peer_allowlist(config)
     ]
   end
 
@@ -188,6 +207,66 @@ defmodule IrohBeam.Distribution.Config do
       net_tickintensity: config.net_tickintensity
     }
   end
+
+  defp peer_allowlist(%__MODULE__{admission: nil, peers: peers}),
+    do: Enum.map(peers, fn {_node, peer} -> peer.id end)
+
+  defp peer_allowlist(%__MODULE__{}), do: :all
+
+  defp resolve_by_name(config, node) do
+    with {:ok, name, host} <- split_id_name(Atom.to_string(node)),
+         true <- admit(config, host, name),
+         {:ok, id} <- EndpointId.parse(host),
+         {:ok, target} <- dial_target(config, id) do
+      {:ok, %{target: target, id: id}}
+    else
+      _ -> {:error, :unknown_peer}
+    end
+  end
+
+  # Without address lookup, a bare ID is undialable; point it at our relays.
+  defp dial_target(%__MODULE__{network: {:custom, relays}}, id),
+    do: EndpointAddr.new(id, relay_urls: Enum.map(relays, &Relay.url/1))
+
+  defp dial_target(_config, id), do: {:ok, id}
+
+  defp claimed_node(config, remote_name, remote_id) do
+    case Enum.find(config.peers, fn {node, _peer} -> Atom.to_string(node) == remote_name end) do
+      {node, %{id: ^remote_id}} -> {:ok, node}
+      {_node, _peer} -> :error
+      nil -> claimed_by_id(config, remote_name, remote_id)
+    end
+  end
+
+  # The claimed name must carry the authenticated key and pass admission before
+  # any atom is created from peer-supplied text.
+  defp claimed_by_id(config, remote_name, remote_id) do
+    with {:ok, name, host} <- split_id_name(remote_name),
+         true <- host == to_string(remote_id),
+         true <- admit(config, host, name) do
+      {:ok, String.to_atom(remote_name)}
+    else
+      _ -> :error
+    end
+  end
+
+  # "name@<64 hex endpoint id>" split without creating atoms.
+  defp split_id_name(text) do
+    with [name, host] <- String.split(text, "@"),
+         true <- name =~ @name_part and host =~ @id_host do
+      {:ok, name, host}
+    else
+      _ -> :error
+    end
+  end
+
+  defp admit(%__MODULE__{admission: {module, function}}, id, name) do
+    apply(module, function, [id, name]) == true
+  catch
+    _kind, _reason -> false
+  end
+
+  defp admit(%__MODULE__{}, _id, _name), do: false
 
   defp load_early do
     _ = Application.load(:iroh_beam)
@@ -237,6 +316,18 @@ defmodule IrohBeam.Distribution.Config do
 
   defp validate_name_domain(_node, _domain),
     do: invalid("name_domain must be :shortnames or :longnames")
+
+  defp validate_admission(nil, _local), do: :ok
+
+  defp validate_admission({module, function}, local) when is_atom(module) and is_atom(function) do
+    case split_id_name(Atom.to_string(local)) do
+      {:ok, _name, _host} -> :ok
+      :error -> invalid("admission requires a name@<endpoint id> node name")
+    end
+  end
+
+  defp validate_admission(_admission, _local),
+    do: invalid("admission must be nil or a {module, function} tuple")
 
   defp validate_identity(:ephemeral), do: :ok
   defp validate_identity(%SecretKey{}), do: :ok

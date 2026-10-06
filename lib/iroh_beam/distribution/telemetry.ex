@@ -10,6 +10,10 @@ defmodule IrohBeam.Distribution.Telemetry do
     execute([:iroh_beam, :distribution, :node, :down], %{count: 1}, %{})
   end
 
+  def path(node, kind, rtt_us) do
+    execute([:iroh_beam, :distribution, :path], %{rtt_us: rtt_us}, %{node: node, kind: kind})
+  end
+
   def rejected(stage) when stage in [:relay, :endpoint_id, :name_binding, :cookie, :frame] do
     execute([:iroh_beam, :distribution, :peer, :rejected], %{count: 1}, %{stage: stage})
   end

@@ -1,19 +1,17 @@
 defmodule IrohBeam.DistributionRelayIntegrationTest do
   use IrohBeam.FixtureCase, async: false
 
-  alias IrohBeam.{DistributionProcess, EndpointAddr, Identity, Relay, SecretKey}
+  alias IrohBeam.{DistributionProcess, EndpointAddr, Identity, Relay, SecretKey, TestRelay}
 
   @moduletag :relay
   @relay_url "http://127.0.0.1:3340"
   @token "iroh-beam-local-test-token-not-for-production"
 
   setup do
-    assert relay_ready?()
+    {_output, 0} = TestRelay.up()
+    assert eventually(&relay_ready?/0, 150)
 
-    on_exit(fn ->
-      _ =
-        System.cmd("docker", ["compose", "up", "--detach", "iroh-relay"], stderr_to_stdout: true)
-    end)
+    on_exit(fn -> _ = TestRelay.up() end)
 
     :ok
   end
@@ -98,8 +96,7 @@ defmodule IrohBeam.DistributionRelayIntegrationTest do
     assert {:ok, a} = DistributionProcess.await_output(a, "BURST true", 20_000)
     assert {:ok, a} = DistributionProcess.await_output(a, "IDLE :pong", 10_000)
 
-    {stop_output, 0} =
-      System.cmd("docker", ["compose", "stop", "iroh-relay"], stderr_to_stdout: true)
+    {stop_output, 0} = TestRelay.stop()
 
     refute stop_output =~ "error"
     Process.sleep(6_000)
@@ -114,8 +111,7 @@ defmodule IrohBeam.DistributionRelayIntegrationTest do
     stop_peer(b)
     stop_peer(c)
 
-    {start_output, 0} =
-      System.cmd("docker", ["compose", "up", "--detach", "iroh-relay"], stderr_to_stdout: true)
+    {start_output, 0} = TestRelay.up()
 
     refute start_output =~ "error"
     assert eventually(&relay_ready?/0, 150)

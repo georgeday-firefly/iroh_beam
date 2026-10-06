@@ -54,6 +54,10 @@ listen(Name) when is_atom(Name) ->
 -spec listen(atom(), string()) ->
           {ok, {pid(), #net_address{}, integer()}} | {error, term()}.
 listen(_Name, Host) ->
+    %% With -no_epmd nothing loads the -epmd_module, and inet_tcp_dist only
+    %% calls its optional callbacks when erlang:function_exported/3 is true.
+    %% Load it so an inet_tcp listener beside us (iroh_loopback_epmd) uses it.
+    _ = code:ensure_loaded(net_kernel:epmd_module()),
     case iroh_dist_support:check() of
         ok ->
             case iroh_dist_endpoint:listener() of
@@ -93,7 +97,7 @@ accept_loop(Kernel, Listen) ->
 accept_connection(AcceptPid, Session, MyNode, _Allowed, SetupTime) ->
     spawn_opt(?MODULE, do_accept,
               [self(), AcceptPid, Session, MyNode, SetupTime,
-               iroh_dist_endpoint:allowed_nodes()],
+               [maps:get(claimed_node, Session)]],
               dist_util:net_ticker_spawn_options()).
 
 do_accept(Kernel, AcceptPid, Session, MyNode, SetupTime, Allowed) ->

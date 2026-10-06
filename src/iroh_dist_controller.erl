@@ -4,6 +4,8 @@
 -export([start_link/1, handshake_complete/3, tick/1, close/1,
          parser_new/0, parser_feed/3]).
 
+-define(PATH_SAMPLE_MS, 5000).
+
 -spec start_link(map()) -> pid().
 start_link(Session) ->
     Parent = self(),
@@ -58,6 +60,7 @@ start_controller(Parent, Session, Node, DistHandle, From, Ref) ->
     Input ! {Controller, start},
     ok = iroh_dist_endpoint:register_link(Node, Session, self()),
     From ! {Ref, ok},
+    erlang:send_after(?PATH_SAMPLE_MS, self(), path_sample),
     try
         erlang:dist_ctrl_get_data_notification(DistHandle),
         output_wait(Parent, Input, Session, DistHandle, Node)
@@ -76,6 +79,9 @@ output_wait(Parent, Input, Session, DistHandle, Node) ->
             output_data(Parent, Input, Session, DistHandle, Node);
         dist_tick ->
             ok = send_packet(Session, Node, 0, []),
+            output_wait(Parent, Input, Session, DistHandle, Node);
+        path_sample ->
+            sample_path(Session, Node),
             output_wait(Parent, Input, Session, DistHandle, Node);
         close ->
             exit(normal);
@@ -104,6 +110,15 @@ output_data(Parent, Input, Session, DistHandle, Node) ->
                     exit({frame_too_large, Length})
             end
     end.
+
+sample_path(Session, Node) ->
+    case 'Elixir.IrohBeam.Connection':path(maps:get(connection, Session)) of
+        {ok, #{kind := Kind, rtt_microseconds := Rtt} = Path} ->
+            iroh_dist_endpoint:update_path(Node, self(), Path),
+            'Elixir.IrohBeam.Distribution.Telemetry':path(Node, Kind, Rtt);
+        _ -> ok
+    end,
+    erlang:send_after(?PATH_SAMPLE_MS, self(), path_sample).
 
 send_packet(Session, Node, Length, Iovec) ->
     IO = 'Elixir.IrohBeam.Distribution.IO',

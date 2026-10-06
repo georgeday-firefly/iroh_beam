@@ -4,9 +4,9 @@
 -behaviour(gen_server).
 
 -export([start_link/0, status/0, peer_info/1, listener/0,
-         resolve/1, allowed_nodes/0, validate_peer/2, validate_preface/3,
+         resolve/1, validate_peer/2, validate_preface/3,
          connect/1, take_incoming/1, register_link/3, unregister_link/2,
-         update_link/5, close_link/1, close_session/1, stop/0]).
+         update_link/5, update_path/3, close_link/1, close_session/1, stop/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
 
@@ -39,10 +39,6 @@ listener() ->
 -spec resolve(node()) -> {ok, map()} | {error, term()}.
 resolve(Node) ->
     call_if_started({resolve, Node}).
-
--spec allowed_nodes() -> [node()].
-allowed_nodes() ->
-    call_if_started(allowed_nodes).
 
 -spec validate_peer(node(), term()) -> ok | {error, term()}.
 validate_peer(Node, RemoteId) ->
@@ -77,6 +73,10 @@ unregister_link(Node, Owner) ->
 update_link(Node, Owner, Direction, Bytes, Frames) ->
     gen_server:cast(?MODULE,
                     {update_link, Node, Owner, Direction, Bytes, Frames}).
+
+-spec update_path(node(), pid(), map()) -> ok.
+update_path(Node, Owner, Path) ->
+    gen_server:cast(?MODULE, {update_path, Node, Owner, Path}).
 
 -spec close_link(node()) -> ok | {error, term()}.
 close_link(Node) ->
@@ -126,6 +126,15 @@ init_endpoint() ->
 finish_init(Config, Endpoint) ->
     EndpointMod = 'Elixir.IrohBeam.Endpoint',
     {ok, Id} = EndpointMod:id(Endpoint),
+    case 'Elixir.IrohBeam.Distribution.Config':'own_name?'(Config, Id) of
+        true -> finish_init(Config, Endpoint, Id);
+        false ->
+            _ = EndpointMod:close(Endpoint),
+            {stop, node_name_identity_mismatch}
+    end.
+
+finish_init(Config, Endpoint, Id) ->
+    EndpointMod = 'Elixir.IrohBeam.Endpoint',
     {ok, Addr} = EndpointMod:addr(Endpoint),
     Owner = self(),
     Acceptor = spawn_link(fun () -> accept_loop(Owner, Endpoint, Config) end),
@@ -164,9 +173,6 @@ handle_call({resolve, Node}, _From, State) ->
             {error, Reason} -> {error, Reason}
         end,
     {reply, Reply, State};
-handle_call(allowed_nodes, _From, State) ->
-    ConfigMod = 'Elixir.IrohBeam.Distribution.Config',
-    {reply, ConfigMod:allowed_nodes(State#state.config), State};
 handle_call({validate_peer, Node, RemoteId}, _From, State) ->
     ConfigMod = 'Elixir.IrohBeam.Distribution.Config',
     Reply =
@@ -256,6 +262,13 @@ handle_cast({update_link, Node, Owner, Direction, Bytes, Frames}, State) ->
             _ -> State#state.links
         end,
     {noreply, State#state{links = Links}};
+handle_cast({update_path, Node, Owner, Path}, State) ->
+    Links =
+        case maps:get(Node, State#state.links, undefined) of
+            #{owner := Owner} = Link -> maps:put(Node, Link#{path := Path}, State#state.links);
+            _ -> State#state.links
+        end,
+    {noreply, State#state{links = Links}};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -294,22 +307,14 @@ accept_loop(Owner, Endpoint, Config) ->
     EndpointMod = 'Elixir.IrohBeam.Endpoint',
     ConnectionMod = 'Elixir.IrohBeam.Connection',
     Timeout = maps:get(accept_timeout, Config),
-    StreamTimeout = maps:get(stream_timeout, Config),
     case EndpointMod:accept(Endpoint, [{timeout, Timeout}]) of
         {ok, Connection} ->
-            case ConnectionMod:accept_bi(Connection, [{timeout, StreamTimeout}]) of
-                {ok, Stream} ->
-                    Info = #{connection => Connection,
-                             stream => Stream,
-                             remote_id => ConnectionMod:remote_id(Connection),
-                             stream_timeout => StreamTimeout,
-                             receive_chunk => maps:get(receive_chunk, Config),
-                             max_frame => maps:get(max_frame, Config)},
-                    case iroh_dist_preface:incoming(Info) of
-                        {ok, Session} -> Owner ! {incoming, Session};
-                        {error, _Reason} -> close_session(Info)
-                    end;
-                {error, _Reason} ->
+            RemoteId = ConnectionMod:remote_id(Connection),
+            case 'Elixir.IrohBeam.Distribution.Config':admit_connection(
+                   Config, RemoteId) of
+                true -> accept_stream(Owner, Connection, RemoteId, Config);
+                false ->
+                    _ = 'Elixir.IrohBeam.Distribution.Telemetry':rejected(endpoint_id),
                     _ = ConnectionMod:close(Connection)
             end,
             accept_loop(Owner, Endpoint, Config);
@@ -320,6 +325,25 @@ accept_loop(Owner, Endpoint, Config) ->
                 closed -> exit(normal);
                 _ -> accept_loop(Owner, Endpoint, Config)
             end
+    end.
+
+accept_stream(Owner, Connection, RemoteId, Config) ->
+    ConnectionMod = 'Elixir.IrohBeam.Connection',
+    StreamTimeout = maps:get(stream_timeout, Config),
+    case ConnectionMod:accept_bi(Connection, [{timeout, StreamTimeout}]) of
+        {ok, Stream} ->
+            Info = #{connection => Connection,
+                     stream => Stream,
+                     remote_id => RemoteId,
+                     stream_timeout => StreamTimeout,
+                     receive_chunk => maps:get(receive_chunk, Config),
+                     max_frame => maps:get(max_frame, Config)},
+            case iroh_dist_preface:incoming(Info) of
+                {ok, Session} -> Owner ! {incoming, Session};
+                {error, _Reason} -> close_session(Info)
+            end;
+        {error, _Reason} ->
+            _ = ConnectionMod:close(Connection)
     end.
 
 call_if_started(Request) ->

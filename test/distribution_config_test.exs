@@ -33,7 +33,6 @@ defmodule IrohBeam.DistributionConfigTest do
 
     assert {:ok, %{id: ^peer_id, target: ^peer_addr}} = Config.resolve(config, :addr@host)
     assert {:ok, :addr@host} = Config.authorize_id(config, peer_id)
-    assert [:addr@host] == Config.allowed_nodes(config)
     assert {:error, :unknown_peer} = Config.resolve(config, :missing@host)
   end
 
