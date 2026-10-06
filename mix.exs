@@ -9,7 +9,7 @@ defmodule IrohBeam.MixProject do
     [
       app: :iroh_beam,
       version: @version,
-      elixir: "~> 1.20",
+      elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       erlc_options: [:warnings_as_errors],
       start_permanent: Mix.env() == :prod,
