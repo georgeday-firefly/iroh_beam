@@ -43,6 +43,7 @@ mod atoms {
         direct,
         no_relay,
         custom,
+        iroh_services,
         connection_connect,
         connection_accept,
         connection_close,

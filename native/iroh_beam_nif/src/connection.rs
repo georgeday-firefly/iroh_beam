@@ -3,6 +3,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use iroh::endpoint::Connection;
+use iroh::protocol::ProtocolHandler;
 use iroh::{EndpointAddr, EndpointId, TransportAddr};
 use rustler::{Atom, Encoder, Env, LocalPid, Monitor, OwnedEnv, Resource, ResourceArc, Term};
 
@@ -315,27 +316,37 @@ fn connection_accept_start<'a>(
         atoms::connection_accept(),
         async move {
             let _permit = permit;
-            let incoming = value.accept().await.ok_or_else(|| {
-                connection_error(
-                    atoms::closed(),
-                    atoms::connection_accept(),
-                    "endpoint closed while accepting",
-                )
-            })?;
-            let accepting = incoming.accept().map_err(|_| {
-                connection_error(
-                    atoms::refused(),
-                    atoms::connection_accept(),
-                    "incoming connection was refused",
-                )
-            })?;
-            let connection = accepting.await.map_err(|_| {
-                connection_error(
-                    atoms::refused(),
-                    atoms::connection_accept(),
-                    "incoming handshake failed",
-                )
-            })?;
+            let connection = loop {
+                let incoming = value.accept().await.ok_or_else(|| {
+                    connection_error(
+                        atoms::closed(),
+                        atoms::connection_accept(),
+                        "endpoint closed while accepting",
+                    )
+                })?;
+                let accepting = incoming.accept().map_err(|_| {
+                    connection_error(
+                        atoms::refused(),
+                        atoms::connection_accept(),
+                        "incoming connection was refused",
+                    )
+                })?;
+                let connection = accepting.await.map_err(|_| {
+                    connection_error(
+                        atoms::refused(),
+                        atoms::connection_accept(),
+                        "incoming handshake failed",
+                    )
+                })?;
+                // iroh-services diagnostics dial-backs are served here and
+                // never reach Elixir; the host checks their grant itself.
+                match operation_endpoint.client_host_for(&connection) {
+                    Some(host) => {
+                        tokio::spawn(async move { host.accept(connection).await });
+                    }
+                    None => break connection,
+                }
+            };
             let remote_id = connection.remote_id().to_string();
             if !allow_all && !allowed_ids.contains(&remote_id) {
                 connection.close(0u32.into(), b"");

@@ -342,6 +342,9 @@ defmodule IrohBeam.Distribution.Config do
       else: invalid("custom network requires validated relay records")
   end
 
+  # The endpoint validates iroh_services settings and reads the secret file.
+  defp validate_network({:iroh_services, options}) when is_list(options), do: :ok
+
   defp validate_network(_network), do: invalid("distribution network profile is invalid")
 
   defp validate_bind(bind, direct_ip)
@@ -446,6 +449,9 @@ defmodule IrohBeam.Distribution.Config do
        Enum.map(relays, fn relay ->
          %{url: Relay.url(relay), token?: Map.get(relay, :token) != nil}
        end)}
+
+  defp safe_network({:iroh_services, options}),
+    do: {:iroh_services, Keyword.take(options, [:relays, :name, :diagnostics])}
 
   defp safe_network(network), do: network
 

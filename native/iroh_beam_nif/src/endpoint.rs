@@ -2,10 +2,14 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use iroh::endpoint::presets;
+use iroh::endpoint::Connection;
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, RelayUrl, Watcher};
+use iroh_services::caps::Caps;
+use iroh_services::{Client as ServicesClient, ClientHost, IrohServicesPreset, CLIENT_HOST_ALPN};
 use rustler::{Atom, Encoder, Env, LocalPid, Monitor, OwnedEnv, Resource, ResourceArc, Term};
 
 use crate::identity::SecretKeyResource;
@@ -19,6 +23,9 @@ const MAX_ALPN_BYTES: usize = 255;
 const MAX_BIND_ADDRS: usize = 8;
 const MAX_RELAYS: usize = 8;
 const MAX_TOKEN_BYTES: usize = 4 * 1_024;
+// Diagnostics grants expire after 30 days; renew well before that.
+const DIAGNOSTICS_GRANT_REFRESH: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const GRANT_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 static ACTIVE_IDENTITIES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static ACTIVE_ENDPOINTS: AtomicUsize = AtomicUsize::new(0);
 
@@ -28,6 +35,7 @@ enum ProfileKind {
     Direct,
     NoRelay,
     Custom,
+    Services,
 }
 
 impl ProfileKind {
@@ -37,15 +45,28 @@ impl ProfileKind {
             Self::Direct => atoms::direct(),
             Self::NoRelay => atoms::no_relay(),
             Self::Custom => atoms::custom(),
+            Self::Services => atoms::iroh_services(),
         }
     }
 
+    fn from_atom(profile: Atom) -> Option<Self> {
+        [
+            Self::N0,
+            Self::Direct,
+            Self::NoRelay,
+            Self::Custom,
+            Self::Services,
+        ]
+        .into_iter()
+        .find(|kind| kind.atom() == profile)
+    }
+
     fn relay_enabled(self) -> bool {
-        matches!(self, Self::N0 | Self::Custom)
+        matches!(self, Self::N0 | Self::Custom | Self::Services)
     }
 
     fn address_lookup_enabled(self) -> bool {
-        matches!(self, Self::N0 | Self::NoRelay)
+        matches!(self, Self::N0 | Self::NoRelay | Self::Services)
     }
 }
 
@@ -55,15 +76,32 @@ struct NativeRelay {
     token: Option<String>,
 }
 
+/// The secret travels as a file path so it never becomes an Erlang term.
+#[derive(rustler::NifMap)]
+struct NativeServices {
+    api_secret_file: String,
+    relays: Vec<String>,
+    name: Option<String>,
+    diagnostics: bool,
+}
+
 #[derive(rustler::NifMap)]
 struct NativeEndpointOptions {
     profile: Atom,
     alpns: Vec<String>,
     bind_addrs: Vec<String>,
     relays: Vec<NativeRelay>,
+    services: Option<NativeServices>,
     max_connections: usize,
     max_pending_accepts: usize,
     direct_ip: bool,
+}
+
+struct ServicesConfig {
+    api_secret: String,
+    relays: Vec<String>,
+    name: Option<String>,
+    diagnostics: bool,
 }
 
 struct BindConfig {
@@ -71,11 +109,14 @@ struct BindConfig {
     alpns: Vec<Vec<u8>>,
     bind_addrs: Vec<SocketAddr>,
     relay_map: Option<RelayMap>,
+    services: Option<ServicesConfig>,
     direct_ip: bool,
 }
 
 pub(crate) struct EndpointResource {
     endpoint: Mutex<Option<Endpoint>>,
+    services: Mutex<Option<ServicesClient>>,
+    client_host: Option<Arc<ClientHost>>,
     endpoint_id: String,
     profile: ProfileKind,
     direct_ip: bool,
@@ -134,6 +175,25 @@ impl EndpointResource {
         self.endpoint.lock().ok().and_then(|mut value| value.take())
     }
 
+    fn take_services(&self) -> Option<ServicesClient> {
+        self.services.lock().ok().and_then(|mut value| value.take())
+    }
+
+    /// The diagnostics host for an iroh-services dial-back, if this connection
+    /// is one and diagnostics are enabled. Such connections never reach Elixir.
+    pub(crate) fn client_host_for(&self, connection: &Connection) -> Option<Arc<ClientHost>> {
+        (connection.alpn() == CLIENT_HOST_ALPN)
+            .then(|| self.client_host.clone())
+            .flatten()
+    }
+
+    fn services_reporting(&self) -> bool {
+        self.services
+            .lock()
+            .map(|value| value.is_some())
+            .unwrap_or(false)
+    }
+
     fn release_identity(&self) {
         if !self.released.swap(true, Ordering::AcqRel) {
             if let Ok(mut identities) = active_identities().lock() {
@@ -144,6 +204,9 @@ impl EndpointResource {
     }
 
     fn abort(&self) -> bool {
+        if let (Some(client), Ok(runtime)) = (self.take_services(), runtime()) {
+            runtime.spawn(async move { client.shutdown().await });
+        }
         let endpoint = self.take_endpoint();
         self.release_identity();
         endpoint.is_some()
@@ -175,6 +238,7 @@ struct EndpointInfo {
     direct_ip: bool,
     online: bool,
     closed: bool,
+    services_reporting: bool,
 }
 
 #[derive(rustler::NifMap)]
@@ -197,6 +261,7 @@ fn parse_config(
     alpns: Vec<String>,
     bind_addrs: Vec<String>,
     relays: Vec<NativeRelay>,
+    services: Option<NativeServices>,
     direct_ip: bool,
 ) -> Result<BindConfig, NativeError> {
     if alpns.is_empty() || alpns.len() > MAX_ALPNS {
@@ -255,20 +320,24 @@ fn parse_config(
         ));
     }
 
-    let profile = if profile == atoms::n0() {
-        ProfileKind::N0
-    } else if profile == atoms::direct() {
-        ProfileKind::Direct
-    } else if profile == atoms::no_relay() {
-        ProfileKind::NoRelay
-    } else if profile == atoms::custom() {
-        ProfileKind::Custom
-    } else {
-        return Err(endpoint_error(
+    let profile = ProfileKind::from_atom(profile).ok_or_else(|| {
+        endpoint_error(
             atoms::invalid_argument(),
             atoms::endpoint_bind(),
             "network profile is invalid",
-        ));
+        )
+    })?;
+
+    let services = match (profile, services) {
+        (ProfileKind::Services, Some(services)) => Some(services_config(services)?),
+        (ProfileKind::Services, None) | (_, Some(_)) => {
+            return Err(endpoint_error(
+                atoms::invalid_argument(),
+                atoms::endpoint_bind(),
+                "iroh services settings require the iroh_services profile",
+            ))
+        }
+        (_, None) => None,
     };
 
     let relay_map = if profile == ProfileKind::Custom {
@@ -340,8 +409,93 @@ fn parse_config(
         alpns: alpns.into_iter().map(String::into_bytes).collect(),
         bind_addrs,
         relay_map,
+        services,
         direct_ip,
     })
+}
+
+fn services_config(services: NativeServices) -> Result<ServicesConfig, NativeError> {
+    let api_secret = std::fs::read_to_string(&services.api_secret_file).map_err(|_| {
+        endpoint_error(
+            atoms::invalid_argument(),
+            atoms::endpoint_bind(),
+            "iroh services API secret file could not be read",
+        )
+    })?;
+    Ok(ServicesConfig {
+        api_secret: api_secret.trim().to_owned(),
+        relays: services.relays,
+        name: services.name,
+        diagnostics: services.diagnostics,
+    })
+}
+
+fn invalid_services<E>(_error: E) -> NativeError {
+    endpoint_error(
+        atoms::invalid_argument(),
+        atoms::endpoint_bind(),
+        "iroh services API secret or relay URLs are invalid",
+    )
+}
+
+// ponytail: the relay token is minted once at bind and iroh-services caps it at
+// 30 days, so a relay reconnect after that fails until the endpoint restarts.
+// Upgrade path: re-mint the token periodically and swap it in with insert_relay.
+fn services_preset(
+    services: &ServicesConfig,
+    secret_key: &iroh::SecretKey,
+) -> Result<IrohServicesPreset, NativeError> {
+    let mut preset = iroh_services::preset()
+        .secret_key(secret_key.clone())
+        .api_secret_from_str(&services.api_secret)
+        .map_err(invalid_services)?;
+    if !services.relays.is_empty() {
+        preset = preset.relays(&services.relays).map_err(invalid_services)?;
+    }
+    preset.build().map_err(invalid_services)
+}
+
+/// Reports the endpoint to the iroh-services dashboard. Best effort: if the
+/// service is unreachable the endpoint keeps working and `services_reporting`
+/// stays false.
+async fn start_services_client(
+    resource: ResourceArc<EndpointResource>,
+    endpoint: Endpoint,
+    setup: ServicesSetup,
+) {
+    let mut builder = setup.preset.client_builder(&endpoint);
+    if let Some(name) = setup.name {
+        match builder.name(name) {
+            Ok(named) => builder = named,
+            Err(_) => return,
+        }
+    }
+    let Ok(client) = builder.build().await else {
+        return;
+    };
+    if resource.released.load(Ordering::Acquire) {
+        client.shutdown().await;
+        return;
+    }
+    if let Ok(mut slot) = resource.services.lock() {
+        *slot = Some(client.clone());
+    }
+    if setup.diagnostics {
+        // Let the project's iroh-services endpoint dial back for diagnostics.
+        // Checks hourly so the task ends within an hour of the endpoint closing.
+        let project = setup.preset.api_secret().addr().id;
+        let mut since_grant = DIAGNOSTICS_GRANT_REFRESH;
+        while !resource.released.load(Ordering::Acquire) {
+            if since_grant >= DIAGNOSTICS_GRANT_REFRESH {
+                let _granted = client
+                    .grant_capability(project, Caps::net_diagnostics_get_any())
+                    .await;
+                since_grant = Duration::ZERO;
+            }
+            tokio::time::sleep(GRANT_CHECK_INTERVAL).await;
+            since_grant += GRANT_CHECK_INTERVAL;
+        }
+    }
 }
 
 fn reserve_identity(endpoint_id: &str) -> Result<(), NativeError> {
@@ -368,10 +522,28 @@ fn release_reserved_identity(endpoint_id: &str) {
     }
 }
 
+struct ServicesSetup {
+    preset: IrohServicesPreset,
+    name: Option<String>,
+    diagnostics: bool,
+}
+
 fn endpoint_builder(
     config: BindConfig,
     secret_key: iroh::SecretKey,
-) -> Result<iroh::endpoint::Builder, NativeError> {
+) -> Result<(iroh::endpoint::Builder, Option<ServicesSetup>), NativeError> {
+    let services = match config.services {
+        Some(services) => Some(ServicesSetup {
+            preset: services_preset(&services, &secret_key)?,
+            name: services.name,
+            diagnostics: services.diagnostics,
+        }),
+        None => None,
+    };
+    let mut alpns = config.alpns;
+    if services.as_ref().is_some_and(|setup| setup.diagnostics) {
+        alpns.push(CLIENT_HOST_ALPN.to_vec());
+    }
     let mut builder = match config.profile {
         ProfileKind::N0 => Endpoint::builder(presets::N0),
         ProfileKind::Direct => Endpoint::builder(presets::Minimal)
@@ -387,9 +559,19 @@ fn endpoint_builder(
                 )
             })?))
             .clear_address_lookup(),
+        ProfileKind::Services => match &services {
+            Some(setup) => Endpoint::builder(setup.preset.clone()),
+            None => {
+                return Err(endpoint_error(
+                    atoms::internal(),
+                    atoms::endpoint_bind(),
+                    "iroh services configuration is unavailable",
+                ))
+            }
+        },
     }
     .secret_key(secret_key)
-    .alpns(config.alpns);
+    .alpns(alpns);
 
     if !config.direct_ip {
         builder = builder.clear_ip_transports();
@@ -405,7 +587,7 @@ fn endpoint_builder(
             })?;
         }
     }
-    Ok(builder)
+    Ok((builder, services))
 }
 
 fn send_operation_result<T: Encoder>(
@@ -436,7 +618,6 @@ fn endpoint_bind_start<'a>(
         Ok(runtime) => runtime,
         Err(error) => return (atoms::error(), error).encode(env),
     };
-    let profile = options.profile;
     let direct_ip = options.direct_ip;
     if options.max_connections == 0
         || options.max_connections > 1_000_000
@@ -460,17 +641,19 @@ fn endpoint_bind_start<'a>(
         options.alpns,
         options.bind_addrs,
         options.relays,
+        options.services,
         options.direct_ip,
     ) {
         Ok(config) => config,
         Err(error) => return (atoms::error(), error).encode(env),
     };
+    let profile = config.profile;
     let endpoint_id = secret_key.key.public().to_string();
     if let Err(error) = reserve_identity(&endpoint_id) {
         return (atoms::error(), error).encode(env);
     }
-    let builder = match endpoint_builder(config, secret_key.key.clone()) {
-        Ok(builder) => builder,
+    let (builder, services) = match endpoint_builder(config, secret_key.key.clone()) {
+        Ok(built) => built,
         Err(error) => {
             release_reserved_identity(&endpoint_id);
             return (atoms::error(), error).encode(env);
@@ -496,15 +679,6 @@ fn endpoint_bind_start<'a>(
     let task_operation = operation.clone();
     let mut owned_env = OwnedEnv::new();
     let saved_ref = owned_env.save(operation_ref);
-    let profile = if profile == atoms::n0() {
-        ProfileKind::N0
-    } else if profile == atoms::direct() {
-        ProfileKind::Direct
-    } else if profile == atoms::no_relay() {
-        ProfileKind::NoRelay
-    } else {
-        ProfileKind::Custom
-    };
     ACTIVE_OPERATIONS.fetch_add(1, Ordering::AcqRel);
 
     let mut bind_task = runtime.spawn(builder.bind());
@@ -527,8 +701,15 @@ fn endpoint_bind_start<'a>(
             let result = match bind_result {
                 Some(Ok(Ok(endpoint))) => {
                     ACTIVE_ENDPOINTS.fetch_add(1, Ordering::AcqRel);
+                    let reporting_endpoint = endpoint.clone();
+                    let client_host = services
+                        .as_ref()
+                        .filter(|setup| setup.diagnostics)
+                        .map(|_| Arc::new(ClientHost::new(&endpoint)));
                     let endpoint_resource = ResourceArc::new(EndpointResource {
                         endpoint: Mutex::new(Some(endpoint)),
+                        services: Mutex::new(None),
+                        client_host,
                         endpoint_id: endpoint_id.clone(),
                         profile,
                         direct_ip,
@@ -539,6 +720,13 @@ fn endpoint_bind_start<'a>(
                         max_connections,
                     });
                     if owned_env.monitor(&endpoint_resource, &caller).is_some() {
+                        if let Some(setup) = services {
+                            tokio::spawn(start_services_client(
+                                endpoint_resource.clone(),
+                                reporting_endpoint,
+                                setup,
+                            ));
+                        }
                         Ok(endpoint_resource)
                     } else {
                         endpoint_resource.abort();
@@ -620,6 +808,7 @@ fn endpoint_info_value(endpoint: &ResourceArc<EndpointResource>) -> EndpointInfo
                 direct_ip: endpoint.direct_ip,
                 online,
                 closed: value.is_closed(),
+                services_reporting: endpoint.services_reporting(),
             }
         }
         None => EndpointInfo {
@@ -633,6 +822,7 @@ fn endpoint_info_value(endpoint: &ResourceArc<EndpointResource>) -> EndpointInfo
             direct_ip: endpoint.direct_ip,
             online: false,
             closed: true,
+            services_reporting: false,
         },
     }
 }
@@ -660,6 +850,9 @@ fn endpoint_close_start<'a>(
         operation_ref,
         atoms::endpoint_close(),
         async move {
+            if let Some(client) = endpoint.take_services() {
+                client.shutdown().await;
+            }
             if let Some(value) = endpoint.take_endpoint() {
                 value.close().await;
             }

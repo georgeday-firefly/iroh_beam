@@ -5,7 +5,15 @@ defmodule IrohBeam.Endpoint do
   Each endpoint is an OTP process with its own private identity and native
   resource. `:direct` uses no relay or address-lookup infrastructure; `:n0`
   uses Iroh's public defaults; `:no_relay` keeps n0 address lookup but disables
-  relays; and `{:custom, relays}` uses only the supplied relay records.
+  relays; `{:custom, relays}` uses only the supplied relay records; and
+  `{:iroh_services, api_secret_file: path, relays: urls, name: name}` uses an
+  iroh-services project: its relays (n0's when `relays` is omitted) with a relay
+  token derived from the project API secret, n0 address lookup, and reporting to
+  the iroh-services dashboard under `name`. The secret is read from the file by
+  the NIF and never held as an Erlang term. `diagnostics: true` also lets the
+  project's iroh-services endpoint dial back and run a network diagnostics report
+  (NAT type, UDP reachability, relay latency); those dial-backs are served by the
+  NIF and never reach Elixir.
   """
 
   use GenServer
@@ -140,6 +148,7 @@ defmodule IrohBeam.Endpoint do
       alpns: config.alpns,
       bind_addrs: config.bind_addrs,
       relays: Enum.map(config.relays, &Relay.to_native/1),
+      services: config.services,
       max_connections: config.limits.max_connections,
       max_pending_accepts: config.limits.max_pending_accepts,
       direct_ip: config.direct_ip
@@ -203,6 +212,7 @@ defmodule IrohBeam.Endpoint do
           relay_enabled?: native_info.relay_enabled,
           address_lookup_enabled?: native_info.address_lookup_enabled,
           direct_ip?: native_info.direct_ip,
+          services_reporting?: native_info.services_reporting,
           bound_sockets: native_info.bound_sockets,
           limits: state.limits
         }
@@ -356,6 +366,7 @@ defmodule IrohBeam.Endpoint do
          {:ok, secret_key} <- resolve_identity(options[:identity]),
          {:ok, alpns} <- validate_alpns(options[:alpns]),
          {:ok, profile, relays} <- validate_network(options[:network]),
+         {:ok, services} <- validate_services(options[:network]),
          {:ok, bind_addrs} <- validate_bind(options[:bind]),
          {:ok, direct_ip} <- validate_direct_ip(options[:direct_ip], bind_addrs),
          {:ok, startup_timeout} <- validate_timeout(options[:startup_timeout], :startup_timeout),
@@ -371,6 +382,7 @@ defmodule IrohBeam.Endpoint do
          alpns: alpns,
          profile: profile,
          relays: relays,
+         services: services,
          bind_addrs: bind_addrs,
          direct_ip: direct_ip,
          startup_timeout: startup_timeout,
@@ -420,7 +432,30 @@ defmodule IrohBeam.Endpoint do
     end
   end
 
+  defp validate_network({:iroh_services, options}) when is_list(options),
+    do: {:ok, :iroh_services, []}
+
   defp validate_network(_network), do: invalid(:endpoint_start, "network profile is invalid")
+
+  defp validate_services({:iroh_services, options}) do
+    with {:ok, options} <-
+           Keyword.validate(options, [:api_secret_file, relays: [], name: nil, diagnostics: false]),
+         path when is_binary(path) and path != "" <- options[:api_secret_file],
+         relays when is_list(relays) and length(relays) <= 8 <- options[:relays],
+         true <- Enum.all?(relays, &is_binary/1),
+         name when is_nil(name) or is_binary(name) <- options[:name],
+         diagnostics when is_boolean(diagnostics) <- options[:diagnostics] do
+      {:ok, %{api_secret_file: path, relays: relays, name: name, diagnostics: diagnostics}}
+    else
+      _ ->
+        invalid(
+          :endpoint_start,
+          "iroh_services needs api_secret_file, and optional relay URL strings, name and diagnostics boolean"
+        )
+    end
+  end
+
+  defp validate_services(_network), do: {:ok, nil}
 
   defp validate_bind(bind_addrs) when is_list(bind_addrs) and length(bind_addrs) <= 8 do
     if Enum.all?(bind_addrs, &is_binary/1),
@@ -499,6 +534,7 @@ defmodule IrohBeam.Endpoint do
   defp name_option(name), do: [name: name]
 
   defp telemetry_profile({:custom, _relays}), do: :custom
+  defp telemetry_profile({:iroh_services, _options}), do: :iroh_services
   defp telemetry_profile(profile) when profile in [:n0, :direct, :minimal, :no_relay], do: profile
   defp telemetry_profile(_profile), do: :invalid
 
